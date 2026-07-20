@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+  <meta charset="utf-8">
+  <title>StarGazer</title>
+  <style>
+    html,
+    body {
+      margin: 0;
+      padding: 0;
+      background: #000;
+      overflow: hidden;
+      font-family: 'Segoe UI', monospace;
+      color: #ddd;
+    }
+
+    #sky {
+      display: block;
+    }
+
+    #hud {
+      position: fixed;
+      top: 10px;
+      left: 10px;
+      font-size: 13px;
+      color: #aab;
+      background: rgba(0, 0, 0, 0.4);
+      padding: 6px 10px;
+      border-radius: 6px;
+    }
+
+    #panel {
+      position: fixed;
+      top: 0;
+      right: 0;
+      width: 300px;
+      height: 100%;
+      background: rgba(8, 8, 16, 0.95);
+      border-left: 1px solid #333;
+      padding: 20px;
+      box-sizing: border-box;
+      transform: translateX(100%);
+      transition: transform 0.25s ease;
+      overflow-y: auto;
+    }
+
+    #panel.open {
+      transform: translateX(0);
+    }
+
+    #panel h2 {
+      margin-top: 0;
+      color: #fff;
+      font-size: 20px;
+    }
+
+    #panel .meta {
+      color: #888;
+      font-size: 12px;
+      margin-bottom: 14px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    #panel .explain {
+      color: #ddd;
+      font-size: 14px;
+      line-height: 1.6;
+    }
+
+    #closeBtn {
+      position: absolute;
+      top: 12px;
+      right: 16px;
+      cursor: pointer;
+      color: #888;
+      font-size: 22px;
+    }
+
+    #closeBtn:hover {
+      color: #fff;
+    }
+  </style>
+</head>
+
+<body>
+  <canvas id="sky"></canvas>
+  <div id="hud">Waiting for phone...</div>
+  <div id="panel">
+    <span id="closeBtn">&times;</span>
+    <h2 id="panelName">-</h2>
+    <div class="meta" id="panelMeta"></div>
+    <div class="explain" id="panelExplain"></div>
+  </div>
+
+  <script>
+    const canvas = document.getElementById('sky');
+    const ctx = canvas.getContext('2d');
+    const hud = document.getElementById('hud');
+    const panel = document.getElementById('panel');
+    const panelName = document.getElementById('panelName');
+    const panelMeta = document.getElementById('panelMeta');
+    const panelExplain = document.getElementById('panelExplain');
+    document.getElementById('closeBtn').onclick = () => panel.classList.remove('open');
+
+    function resize() {
+      canvas.width = window.innerWidth;
+      canvas.height = window.innerHeight;
+    }
+    window.addEventListener('resize', resize);
+    resize();
+
+    const FOV = 45; // degrees shown from center to edge
+
+    let pointing = { az: null, alt: null, lat: null, lon: null };
+    let catalog = { stars: [], messier: [], planets: [], constellation_lines: [] };
+    let clickables = [];
+
+    function angDeltaAz(a, b) {
+      let d = a - b;
+      while (d > 180) d -= 360;
+      while (d < -180) d += 360;
+      return d;
+    }
+
+    function project(az, alt) {
+      const daz = angDeltaAz(az, pointing.az);
+      const dalt = alt - pointing.alt;
+      const x = daz * Math.cos(pointing.alt * Math.PI / 180);
+      const y = dalt;
+      return { x, y };
+    }
+
+    function draw() {
+      ctx.fillStyle = '#000';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+      if (pointing.az === null) {
+        requestAnimationFrame(draw);
+        return;
+      }
+
+      const scale = Math.min(canvas.width, canvas.height) / (2 * FOV);
+      const cx = canvas.width / 2;
+      const cy = canvas.height / 2;
+      clickables = [];
+
+      // constellation lines
+      ctx.strokeStyle = 'rgba(120,140,170,0.45)';
+      ctx.lineWidth = 1;
+      for (const line of catalog.constellation_lines) {
+        ctx.beginPath();
+        let first = true;
+        for (const pt of line) {
+          const p = project(pt.az, pt.alt);
+          const sx = cx + p.x * scale;
+          const sy = cy - p.y * scale;
+          if (first) { ctx.moveTo(sx, sy); first = false; }
+          else ctx.lineTo(sx, sy);
+        }
+        ctx.stroke();
+      }
+
+      // stars
+      for (const s of catalog.stars) {
+        const p = project(s.az, s.alt);
+        if (Math.abs(p.x) > FOV || Math.abs(p.y) > FOV) continue;
+        const sx = cx + p.x * scale;
+        const sy = cy - p.y * scale;
+        const r = Math.max(1, (6 - s.mag) * 0.9);
+        ctx.beginPath();
+        ctx.arc(sx, sy, r, 0, Math.PI * 2);
+        ctx.fillStyle = '#fff';
+        ctx.shadowColor = '#fff';
+        ctx.shadowBlur = r * 1.5;
+        ctx.fill();
+        ctx.shadowBlur = 0;
+        if (s.mag < 2 && s.name) {
+          ctx.fillStyle = '#ffeeaa';
+          ctx.font = '11px monospace';
+          ctx.fillText(s.name, sx + 6, sy + 4);
+        }
+        clickables.push({ x: sx, y: sy, name: s.name || `Star (mag ${s.mag.toFixed(1)})`, type: 'star', mag: s.mag });
+      }
+
+      // messier deep-sky objects
+      for (const m of catalog.messier) {
+        const p = project(m.az, m.alt);
+        if (Math.abs(p.x) > FOV || Math.abs(p.y) > FOV) continue;
+        const sx = cx + p.x * scale;
+        const sy = cy - p.y * scale;
+        ctx.strokeStyle = '#5fd6ff';
+        ctx.lineWidth = 1.5;
+        ctx.strokeRect(sx - 5, sy - 5, 10, 10);
+        ctx.fillStyle = '#5fd6ff';
+        ctx.font = '11px monospace';
+        ctx.fillText(m.name, sx + 8, sy + 4);
+        clickables.push({ x: sx, y: sy, name: m.name, type: 'deep sky object', mag: m.mag });
+      }
+
+      // planets
+      for (const pl of catalog.planets) {
+        const p = project(pl.az, pl.alt);
+        if (Math.abs(p.x) > FOV * 1.3 || Math.abs(p.y) > FOV * 1.3) continue;
+        const sx = cx + p.x * scale;
+        const sy = cy - p.y * scale;
+        ctx.beginPath();
+        ctx.arc(sx, sy, 8, 0, Math.PI * 2);
+        ctx.fillStyle = '#ffa500';
+        ctx.shadowColor = '#ffa500';
+        ctx.shadowBlur = 14;
+        ctx.fill();
+        ctx.shadowBlur = 0;
+        ctx.fillStyle = '#ffcc66';
+        ctx.font = 'bold 13px monospace';
+        ctx.fillText(pl.name, sx + 12, sy + 4);
+        clickables.push({ x: sx, y: sy, name: pl.name, type: 'planet', mag: null });
+      }
+
+      // center crosshair - exactly where the phone is pointing
+      ctx.strokeStyle = '#ff3333';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(cx - 12, cy); ctx.lineTo(cx + 12, cy);
+      ctx.moveTo(cx, cy - 12); ctx.lineTo(cx, cy + 12);
+      ctx.stroke();
+
+      hud.textContent = `az=${pointing.az.toFixed(1)}  alt=${pointing.alt.toFixed(1)}` +
+        (pointing.lat != null ? `   lat=${pointing.lat.toFixed(4)}  lon=${pointing.lon.toFixed(4)}` : '');
+
+      requestAnimationFrame(draw);
+    }
+    requestAnimationFrame(draw);
+
+    canvas.addEventListener('click', (e) => {
+      const rect = canvas.getBoundingClientRect();
+      const cx = e.clientX - rect.left;
+      const cy = e.clientY - rect.top;
+      let best = null, bestDist = 22;
+      for (const c of clickables) {
+        const d = Math.hypot(c.x - cx, c.y - cy);
+        if (d < bestDist) { bestDist = d; best = c; }
+      }
+      if (best) openPanel(best);
+    });
+
+    async function openPanel(obj) {
+      panelName.textContent = obj.name;
+      panelMeta.textContent = obj.mag !== null ? `${obj.type} · mag ${obj.mag.toFixed(2)}` : obj.type;
+      panelExplain.textContent = 'Loading...';
+      panel.classList.add('open');
+      try {
+        const res = await fetch(`/api/explain?name=${encodeURIComponent(obj.name)}&type=${encodeURIComponent(obj.type)}`);
+        const data = await res.json();
+        panelExplain.textContent = data.explanation;
+      } catch (err) {
+        panelExplain.textContent = 'Could not load explanation.';
+      }
+    }
+
+    // ── WebSocket connection to backend ─────────────────────────────────
+    function connect() {
+      const ws = new WebSocket(`ws://${location.host}/ws`);
+      ws.onmessage = (event) => {
+        const msg = JSON.parse(event.data);
+        if (msg.type === 'catalog') {
+          catalog = msg;
+        } else if (msg.type === 'pointing') {
+          pointing = { az: msg.az, alt: msg.alt, lat: msg.lat, lon: msg.lon };
+        }
+      };
+      ws.onclose = () => setTimeout(connect, 1000);
+    }
+    connect();
+  </script>
+</body>
+
+</html>

@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+  <meta charset="utf-8">
+  <title>StarGazer</title>
+  <style>
+    html,
+    body {
+      margin: 0;
+      padding: 0;
+      background: #000;
+      overflow: hidden;
+      font-family: 'Segoe UI', monospace;
+      color: #ddd;
+      height: 100%;
+      width: 100%;
+    }
+
+    #sky {
+      display: block;
+    }
+
+    #hud {
+      position: fixed;
+      top: 10px;
+      left: 10px;
+      font-size: 13px;
+      color: #aab;
+      background: rgba(0, 0, 0, 0.4);
+      padding: 6px 10px;
+      border-radius: 6px;
+    }
+
+    #panel {
+      position: fixed;
+      top: 0;
+      right: 0;
+      width: 300px;
+      height: 100%;
+      background: rgba(8, 8, 16, 0.95);
+      border-left: 1px solid #333;
+      padding: 20px;
+      box-sizing: border-box;
+      transform: translateX(100%);
+      transition: transform 0.25s ease;
+      overflow-y: auto;
+    }
+
+    #panel.open {
+      transform: translateX(0);
+    }
+
+    #panel h2 {
+      margin-top: 0;
+      color: #fff;
+      font-size: 20px;
+    }
+
+    #panel .meta {
+      color: #888;
+      font-size: 12px;
+      margin-bottom: 14px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    #panel .explain {
+      color: #ddd;
+      font-size: 14px;
+      line-height: 1.6;
+    }
+
+    #closeBtn {
+      position: absolute;
+      top: 12px;
+      right: 16px;
+      cursor: pointer;
+      color: #888;
+      font-size: 22px;
+    }
+
+    #closeBtn:hover {
+      color: #fff;
+    }
+  </style>
+</head>
+
+<body>
+  <canvas id="sky"></canvas>
+  <div id="hud">Waiting for phone...</div>
+  <div id="panel">
+    <span id="closeBtn">&times;</span>
+    <h2 id="panelName">-</h2>
+    <div class="meta" id="panelMeta"></div>
+    <div class="explain" id="panelExplain"></div>
+  </div>
+
+  <script>
+    const canvas = document.getElementById('sky');
+    const ctx = canvas.getContext('2d');
+    const hud = document.getElementById('hud');
+    const panel = document.getElementById('panel');
+    const panelName = document.getElementById('panelName');
+    const panelMeta = document.getElementById('panelMeta');
+    const panelExplain = document.getElementById('panelExplain');
+    document.getElementById('closeBtn').onclick = () => panel.classList.remove('open');
+
+    function resize() {
+      canvas.width = window.innerWidth;
+      canvas.height = window.innerHeight;
+    }
+    window.addEventListener('resize', resize);
+    resize();
+
+    const FOV = 45; // degrees shown from center to edge
+
+    const PLANET_STYLE = {
+      'Sun': { color: '#fff59d', radius: 11, glow: 24 },
+      'Moon': { color: '#e8e8e8', radius: 8, glow: 8 },
+      'Mercury': { color: '#9e9e9e', radius: 4, glow: 5 },
+      'Venus': { color: '#fff2cc', radius: 7, glow: 15 },
+      'Mars': { color: '#e2624a', radius: 5, glow: 9 },
+      'Jupiter': { color: '#d9b38c', radius: 8, glow: 9 },
+      'Saturn': { color: '#e6cf9a', radius: 7, glow: 9, ring: true },
+    };
+    const DEFAULT_PLANET_STYLE = { color: '#ffa500', radius: 7, glow: 12 };
+
+    let pointing = { az: null, alt: null, lat: null, lon: null };
+    let catalog = { stars: [], messier: [], planets: [], constellation_lines: [] };
+    let clickables = [];
+
+    function toRad(d) { return d * Math.PI / 180; }
+    function toDeg(r) { return r * 180 / Math.PI; }
+
+    // Gnomonic (tangent-plane) projection - the same math real finder-scope
+    // and planetarium views use. Unlike a flat lat/long-style approximation,
+    // this stays geometrically correct across the whole view instead of
+    // stretching as you move away from center. Returns null for anything
+    // more than ~90 deg from center (behind the viewer - shouldn't render).
+    function project(az, alt) {
+      const a0 = toRad(pointing.alt), a = toRad(alt);
+      const dAz = toRad(az - pointing.az);
+
+      const cosC = Math.sin(a0) * Math.sin(a) + Math.cos(a0) * Math.cos(a) * Math.cos(dAz);
+      if (cosC <= 0.01) return null;
+
+      const x = Math.cos(a) * Math.sin(dAz) / cosC;
+      const y = (Math.cos(a0) * Math.sin(a) - Math.sin(a0) * Math.cos(a) * Math.cos(dAz)) / cosC;
+
+      return { x: toDeg(x), y: toDeg(y) };
+    }
+
+    function draw() {
+      ctx.fillStyle = '#000';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+      if (pointing.az === null) {
+        requestAnimationFrame(draw);
+        return;
+      }
+
+      // Scale is based on canvas HEIGHT so vertical FOV stays fixed at the
+      // base FOV value; on wide screens the horizontal extent is naturally
+      // wider (like a real wide-angle view), so we track halfW/halfH
+      // separately instead of clipping everything to a fixed square box -
+      // that was leaving empty black bars on the sides of wide windows.
+      const scale = canvas.height / (2 * FOV);
+      const halfW = canvas.width / (2 * scale);
+      const halfH = canvas.height / (2 * scale);
+      const cx = canvas.width / 2;
+      const cy = canvas.height / 2;
+      clickables = [];
+
+      // constellation lines - only connect two consecutive points if they're
+      // actually close to EACH OTHER (not just individually close to center -
+      // two points can each be near center yet far apart, which was causing
+      // long stray lines to cut across the whole view)
+      const MAX_LINE_JUMP = 15; // degrees - real constellation segments are short
+      ctx.strokeStyle = 'rgba(120,140,170,0.45)';
+      ctx.lineWidth = 1;
+      for (const line of catalog.constellation_lines) {
+        for (let i = 0; i < line.length - 1; i++) {
+          const p1 = project(line[i].az, line[i].alt);
+          const p2 = project(line[i + 1].az, line[i + 1].alt);
+          if (!p1 || !p2) continue;
+          if (Math.hypot(p2.x - p1.x, p2.y - p1.y) > MAX_LINE_JUMP) continue;
+          if (Math.abs(p1.x) > halfW * 1.2 && Math.abs(p2.x) > halfW * 1.2) continue;
+          if (Math.abs(p1.y) > halfH * 1.2 && Math.abs(p2.y) > halfH * 1.2) continue;
+          ctx.beginPath();
+          ctx.moveTo(cx + p1.x * scale, cy - p1.y * scale);
+          ctx.lineTo(cx + p2.x * scale, cy - p2.y * scale);
+          ctx.stroke();
+        }
+      }
+
+      // stars
+      for (const s of catalog.stars) {
+        const p = project(s.az, s.alt);
+        if (!p || Math.abs(p.x) > halfW || Math.abs(p.y) > halfH) continue;
+        const sx = cx + p.x * scale;
+        const sy = cy - p.y * scale;
+        const r = Math.max(1, (6 - s.mag) * 0.9);
+        ctx.beginPath();
+        ctx.arc(sx, sy, r, 0, Math.PI * 2);
+        ctx.fillStyle = '#fff';
+        ctx.shadowColor = '#fff';
+        ctx.shadowBlur = r * 1.5;
+        ctx.fill();
+        ctx.shadowBlur = 0;
+        if (s.mag < 2 && s.name) {
+          ctx.fillStyle = '#ffeeaa';
+          ctx.font = '11px monospace';
+          ctx.fillText(s.name, sx + 6, sy + 4);
+        }
+        clickables.push({ x: sx, y: sy, name: s.name || `Star (mag ${s.mag.toFixed(1)})`, type: 'star', mag: s.mag });
+      }
+
+      // messier deep-sky objects
+      for (const m of catalog.messier) {
+        const p = project(m.az, m.alt);
+        if (!p || Math.abs(p.x) > halfW || Math.abs(p.y) > halfH) continue;
+        const sx = cx + p.x * scale;
+        const sy = cy - p.y * scale;
+        ctx.strokeStyle = '#5fd6ff';
+        ctx.lineWidth = 1.5;
+        ctx.strokeRect(sx - 5, sy - 5, 10, 10);
+        ctx.fillStyle = '#5fd6ff';
+        ctx.font = '11px monospace';
+        ctx.fillText(m.name, sx + 8, sy + 4);
+        clickables.push({ x: sx, y: sy, name: m.name, type: 'deep sky object', mag: m.mag });
+      }
+
+      // planets - each gets its own realistic color/size, Saturn gets a ring
+      for (const pl of catalog.planets) {
+        const p = project(pl.az, pl.alt);
+        if (!p || Math.abs(p.x) > halfW * 1.3 || Math.abs(p.y) > halfH * 1.3) continue;
+        const sx = cx + p.x * scale;
+        const sy = cy - p.y * scale;
+        const style = PLANET_STYLE[pl.name] || DEFAULT_PLANET_STYLE;
+
+        if (style.ring) {
+          ctx.strokeStyle = style.color;
+          ctx.lineWidth = 1.5;
+          ctx.save();
+          ctx.translate(sx, sy);
+          ctx.rotate(-0.35);
+          ctx.beginPath();
+          ctx.ellipse(0, 0, style.radius * 2.1, style.radius * 0.7, 0, 0, Math.PI * 2);
+          ctx.stroke();
+          ctx.restore();
+        }
+
+        ctx.beginPath();
+        ctx.arc(sx, sy, style.radius, 0, Math.PI * 2);
+        ctx.fillStyle = style.color;
+        ctx.shadowColor = style.color;
+        ctx.shadowBlur = style.glow;
+        ctx.fill();
+        ctx.shadowBlur = 0;
+
+        ctx.fillStyle = style.color;
+        ctx.font = 'bold 13px monospace';
+        ctx.fillText(pl.name, sx + style.radius + 5, sy + 4);
+        clickables.push({ x: sx, y: sy, name: pl.name, type: 'planet', mag: null });
+      }
+
+      // center crosshair - exactly where the phone is pointing
+      ctx.strokeStyle = '#ff3333';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(cx - 12, cy); ctx.lineTo(cx + 12, cy);
+      ctx.moveTo(cx, cy - 12); ctx.lineTo(cx, cy + 12);
+      ctx.stroke();
+
+      hud.textContent = `az=${pointing.az.toFixed(1)}  alt=${pointing.alt.toFixed(1)}` +
+        (pointing.lat != null ? `   lat=${pointing.lat.toFixed(4)}  lon=${pointing.lon.toFixed(4)}` : '');
+
+      requestAnimationFrame(draw);
+    }
+    requestAnimationFrame(draw);
+
+    canvas.addEventListener('click', (e) => {
+      const rect = canvas.getBoundingClientRect();
+      const cx = e.clientX - rect.left;
+      const cy = e.clientY - rect.top;
+      let best = null, bestDist = 22;
+      for (const c of clickables) {
+        const d = Math.hypot(c.x - cx, c.y - cy);
+        if (d < bestDist) { bestDist = d; best = c; }
+      }
+      if (best) openPanel(best);
+    });
+
+    async function openPanel(obj) {
+      panelName.textContent = obj.name;
+      panelMeta.textContent = obj.mag !== null ? `${obj.type} · mag ${obj.mag.toFixed(2)}` : obj.type;
+      panelExplain.textContent = 'Loading...';
+      panel.classList.add('open');
+      try {
+        const res = await fetch(`/api/explain?name=${encodeURIComponent(obj.name)}&type=${encodeURIComponent(obj.type)}`);
+        const data = await res.json();
+        panelExplain.textContent = data.explanation;
+      } catch (err) {
+        panelExplain.textContent = 'Could not load explanation.';
+      }
+    }
+
+    // ── WebSocket connection to backend ─────────────────────────────────
+    function connect() {
+      const ws = new WebSocket(`ws://${location.host}/ws`);
+      ws.onmessage = (event) => {
+        const msg = JSON.parse(event.data);
+        if (msg.type === 'catalog') {
+          catalog = msg;
+        } else if (msg.type === 'pointing') {
+          pointing = { az: msg.az, alt: msg.alt, lat: msg.lat, lon: msg.lon };
+        }
+      };
+      ws.onclose = () => setTimeout(connect, 1000);
+    }
+    connect();
+  </script>
+</body>
+
+</html>
