@@ -43,6 +43,11 @@ finished software.
 
 ---
 
+<p align="center">
+  <img src="images/img2.png" width="48%">
+  <img src="images/img.png" width="48%">
+</p>
+
 ## How it works (architecture)
 
 ```
