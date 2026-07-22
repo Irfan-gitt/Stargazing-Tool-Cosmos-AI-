@@ -77,7 +77,7 @@ at the top of each file for what it's responsible for.
 ### 1. Clone and install
 
 ```bash
-git clone <your-repo-url>
+git clone <https://github.com/Irfan-gitt/Stargazing-Tool-Cosmos-AI->
 cd stargazer
 pip install -r requirements.txt
 ```
@@ -87,7 +87,7 @@ pip install -r requirements.txt
 Copy `.env.example` to `.env` and fill in your own keys:
 
 ```dotenv
-GROQ_API_KEY=your_groq_key_here
+GROQ_API_KEY=your_groq_key_here,add another key if possible
 SERPER_API_KEY=your_serper_key_here
 ```
 
