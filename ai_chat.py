@@ -1,86 +1,134 @@
 """
-ai_chat.py - Conversation memory and the AI "brain"
+ai_chat.py - Conversation memory and the AI "brain" (LangGraph + LangChain edition)
 ----------------------------------------------------------------------
 Everything about TALKING TO THE AI lives here: turning "what the user
 is looking at" into context the AI can use, keeping track of the
-conversation so far, and the one function that actually calls an LLM.
+conversation so far via a LangGraph graph, and calling an LLM through
+LangChain's chat model interface.
 
-*** call_llm() is the only function that changes when you pick a
-provider (Groq / Anthropic / OpenAI / Cerebras / ...). Everything else
-in this file, and everything in server.py, stays the same. ***
+*** The LLM is configured in one spot (see `llm = ChatGroq(...)` below).
+Swapping providers later just means swapping that one object for
+ChatOpenAI / ChatAnthropic / etc. - everything else, including
+server.py, stays the same. ***
 
 API KEY SETUP:
-    Create a file named ".env" in this same folder 
-        GROQ_API_KEY=your_actual_key_here
-    This keeps the key out of your source code entirely - the app
-    reads it from the environment, never hardcoded, never sent to the
-    browser. Since we're providing the key (not the end user), this is
-    the only place it needs to live.
+    Create a file named ".env" in this same folder with EITHER:
+
+        GROQ_API_KEYS=key1,key2,key3,key4     (recommended - comma separated,
+                                                no spaces. Rotates to the next
+                                                key automatically whenever the
+                                                current one hits a rate limit)
+    or just:
+        GROQ_API_KEY=your_single_key_here     (still works, treated as a
+                                                list of one)
+
+    This keeps keys out of your source code entirely - the app reads
+    them from the environment, never hardcoded, never sent to the
+    browser. Since we're providing the keys (not the end user), this is
+    the only place they need to live.
+
+Requires:
+    pip install langgraph langchain langchain-groq python-dotenv
 """
 
 import os
 import json
-import requests
+import re
 from dotenv import load_dotenv
 
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, trim_messages
+from langchain_groq import ChatGroq
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.prebuilt import ToolNode, tools_condition
+from typing import Annotated, TypedDict
+from tools import STARGAZER_TOOLS
+
 load_dotenv()  # reads .env into the environment, if the file exists
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GROQ_MODEL = "llama-3.3-70b-versatile"  # same conversational model TARZ uses
 
-# LLMs are stateless - every API call is a blank slate unless YOU resend
-# the past conversation each time. This list IS the memory: every
-# message (yours and the AI's) gets appended here, and the FULL list
-# gets sent on every request so the AI can see what was said before.
-#
-# NOTE: single global list - fine for a personal local tool like this
-# (one person, one browser tab). A real multi-user product would need a
-# separate history per session/user.
-MAX_HISTORY_MESSAGES = 20  # keep this bounded - LLMs have a context limit
+# ---------------------------------------------------------------------
+# API KEY ROTATION
+# ---------------------------------------------------------------------
+# Free-tier keys each have their own rate limit. Instead of the whole
+# app breaking the moment ONE key gets rate limited, we keep a list and
+# automatically switch to the next one when that happens. ChatGroq is
+# built with a single key at construction time, so "rotating" means
+# rebuilding it with the next key - _build_llm() below does that.
+_keys_raw = os.environ.get(
+    "GROQ_API_KEYS") or os.environ.get("GROQ_API_KEY") or ""
+GROQ_API_KEYS = [k.strip() for k in _keys_raw.split(",") if k.strip()]
 
-# Simple on-disk persistence so conversation memory survives server restarts.
+_current_key_index = 0
+
+MAX_HISTORY_MESSAGES = 20
+THREAD_ID = "local-session"
+
 MEMORY_FILE = os.path.join(os.path.dirname(
     os.path.abspath(__file__)), "conversation_history.json")
-conversation_history = []
+
+TOOL_DISPLAY_NAMES = {
+    "web_search": "web search", "nasa_articles": "NASA article search",
+    "latest_discoveries": "latest discoveries", "weather_conditions": "weather check",
+    "local_sky_time": "local sky-time check",
+    "moon_phase": "moon phase check", "night_planner": "night planner",
+    "photography_advice": "photography advice", "rise_set_times": "rise and set calculator",
+    "light_pollution_report": "light-pollution report", "meteor_showers": "meteor-shower guide",
+    "equipment_advice": "equipment advice", "object_information": "object lookup",
+    "tle_updates": "TLE update", "satellite_status": "satellite status",
+    "pass_predictions": "pass prediction", "satellite_visibility": "satellite visibility check",
+}
 
 
-def _load_history():
-    try:
-        with open(MEMORY_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            if isinstance(data, list):
-                # keep only the tail that's within the token/window budget
-                conversation_history.extend(data[-MAX_HISTORY_MESSAGES:])
-    except FileNotFoundError:
-        # first run - no history yet
-        return
-    except Exception as e:
-        print(f"Warning: failed to load conversation history: {e}")
+def _clean_tool_syntax(reply):
+    def replacement(match):
+        tool_name = match.group(1)
+        return TOOL_DISPLAY_NAMES.get(tool_name, tool_name.replace("_", " "))
+    reply = re.sub(r"<function=([a-zA-Z0-9_]+)>", replacement, reply)
+    reply = re.sub(r"</function>", "", reply)
+    return reply
 
 
-def _save_history():
-    try:
-        with open(MEMORY_FILE, "w", encoding="utf-8") as f:
-            json.dump(
-                conversation_history[-MAX_HISTORY_MESSAGES:], f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"Warning: failed to save conversation history: {e}")
+class ChatState(TypedDict):
+    messages: Annotated[list, add_messages]
 
 
-# load history at import time
-_load_history()
+def _build_llm(api_key):
+    """Builds a fresh ChatGroq + tool-bound version using the given key."""
+    llm = ChatGroq(model=GROQ_MODEL, api_key=api_key,
+                   max_tokens=500, timeout=15)
+    return llm, llm.bind_tools(STARGAZER_TOOLS)
+
+
+def _rotate_key():
+    """Switches to the next key in the list (wraps around) and rebuilds the LLM with it."""
+    global _current_key_index, llm, llm_with_tools
+    _current_key_index = (_current_key_index + 1) % len(GROQ_API_KEYS)
+    llm, llm_with_tools = _build_llm(GROQ_API_KEYS[_current_key_index])
+    print(
+        f"[ai_chat] Rate limit hit - rotated to API key #{_current_key_index + 1}/{len(GROQ_API_KEYS)}")
+
+
+llm = None
+llm_with_tools = None
+if GROQ_API_KEYS:
+    llm, llm_with_tools = _build_llm(GROQ_API_KEYS[_current_key_index])
 
 
 def build_context_message(context):
-    """
-    Turns 'what the user is currently looking at' into a system message -
-    this is what lets someone ask "why is it red?" instead of typing
-    "Mars" every time. The frontend auto-tracks whatever's nearest the
-    crosshair every frame (see updateAutoContext in index.html) and sends
-    it with every chat request - so this updates even without a click.
-    """
+    tool_guidance = (
+        "You are StarGazer's observing assistant. Use the provided tools whenever a user asks for "
+        "current local time or whether it is day/twilight/night, current weather, moon conditions, NASA/news research, rise/set times, meteor showers, equipment "
+        "advice, satellite status/visibility/passes, light-pollution assessment, or a catalog lookup. "
+        "Do not invent live results. Give concise, practical answers and mention when a result is approximate."
+        " Never show internal function names, tool-call tags, XML tool syntax, or instructions such as "
+        "'<function=...>' to the user. Call a tool through the tool interface when needed; otherwise describe "
+        "capabilities in plain language."
+    )
     if not context:
         return ("The user isn't pointing at any specific catalog object right now - "
-                "they may be asking a general astronomy question")
+                f"they may be asking a general astronomy question. {tool_guidance}")
 
     name = context.get("name", "an unknown object")
     otype = context.get("type", "object")
@@ -90,98 +138,150 @@ def build_context_message(context):
     ang_dist = context.get("angularDistance")
 
     mag_part = f", magnitude {mag:.2f}" if mag is not None else ""
-
     direction_part = ""
     if az is not None and alt is not None:
         direction_part = f" It's at azimuth {az:.1f} degrees, {alt:.1f} degrees above the horizon."
-
     precision_part = ""
     if ang_dist is not None:
         precision_part = f" (about {ang_dist:.1f} degrees from dead-center of where they're pointing)"
+    location_part = ""
+    lat = context.get("lat")
+    lon = context.get("lon")
+    if lat is not None and lon is not None:
+        location_part = (f" The observing location is latitude {lat:.4f}, longitude {lon:.4f}. "
+                         "Use these coordinates when calling weather, night planner, or satellite tools.")
 
     return (f"The user is currently pointing their phone at {name} "
             f"(a {otype}{mag_part}).{direction_part}{precision_part} "
-            f"Answer as if you can see this too.")
+            f"Answer as if you can see this too.{location_part} {tool_guidance}")
 
 
-def call_llm(messages):
+def call_model(state: ChatState):
     """
     *** THIS IS THE SPOT ***
-    Calls Groq's chat API - free tier, generous token limits, good for
-    "normal conversation" since we're publishing this without asking
-    end users for their own API key.
-
-    Every LLM provider accepts basically the same shape here: a list of
-    {"role": "system"|"user"|"assistant", "content": "..."} dicts, and
-    returns a single string reply - that's why swapping providers later
-    only means changing what's INSIDE this function.
-
-    NOTE ON TOOL CALLING: this function is for plain conversation only.
-    Once we add actual tools (functions the AI can call, like TARZ has),
-    that'll be a SEPARATE function - see call_llm_with_tools() below -
-    using GPT-4o-mini via GitHub Models first, Cerebras as fallback,
-    since tool-calling reliability matters more there than raw speed.
+    Calls the configured LangChain chat model with the running message
+    list. On a rate-limit error, rotates to the next API key and retries
+    - up to once per key, so a single request never loops forever even
+    if every key happens to be exhausted at once.
     """
-    if not GROQ_API_KEY:
-        return ("(No AI connected) GROQ_API_KEY isn't set. Create a .env file "
-                "in this folder with GROQ_API_KEY=your_key_here, then restart the server.")
+    if not GROQ_API_KEYS:
+        reply = ("(No AI connected) No Groq API keys set. Add GROQ_API_KEYS=key1,key2,key3,key4 "
+                 "to your .env file, then restart the server.")
+        return {"messages": [AIMessage(content=reply)]}
 
+    trimmed = trim_messages(
+        state["messages"],
+        max_tokens=MAX_HISTORY_MESSAGES,
+        token_counter=len,
+        strategy="last",
+        start_on="human",
+        include_system=True,
+    )
+
+    attempts = 0
+    max_attempts = len(GROQ_API_KEYS)  # try each key at most once per request
+
+    while attempts < max_attempts:
+        try:
+            response = llm_with_tools.invoke(trimmed)
+            return {"messages": [response]}
+        except Exception as e:
+            msg = str(e)
+            if "429" in msg or "rate" in msg.lower():
+                attempts += 1
+                if attempts < max_attempts:
+                    _rotate_key()
+                    continue
+                reply = f"(AI error: all {len(GROQ_API_KEYS)} API keys are currently rate-limited - try again shortly.)"
+                return {"messages": [AIMessage(content=reply)]}
+            elif "401" in msg:
+                reply = "(AI error: API key was rejected - check your keys in .env)"
+                return {"messages": [AIMessage(content=reply)]}
+            elif "timeout" in msg.lower() or "timed out" in msg.lower():
+                reply = "(AI request timed out - try again.)"
+                return {"messages": [AIMessage(content=reply)]}
+            else:
+                reply = f"(AI error: {e})"
+                return {"messages": [AIMessage(content=reply)]}
+
+
+_graph_builder = StateGraph(ChatState)
+_graph_builder.add_node("model", call_model)
+_graph_builder.add_node("tools", ToolNode(STARGAZER_TOOLS))
+_graph_builder.add_edge(START, "model")
+_graph_builder.add_conditional_edges("model", tools_condition)
+_graph_builder.add_edge("tools", "model")
+
+_checkpointer = MemorySaver()
+graph = _graph_builder.compile(checkpointer=_checkpointer)
+
+
+def _message_from_dict(d):
+    role = d.get("role")
+    content = d.get("content", "")
+    if role == "user":
+        return HumanMessage(content=content)
+    elif role == "assistant":
+        return AIMessage(content=content)
+    elif role == "system":
+        return SystemMessage(content=content)
+    return HumanMessage(content=content)
+
+
+def _message_to_dict(m):
+    if isinstance(m, HumanMessage):
+        role = "user"
+    elif isinstance(m, AIMessage):
+        role = "assistant"
+    elif isinstance(m, SystemMessage):
+        role = "system"
+    else:
+        role = "user"
+    return {"role": role, "content": m.content}
+
+
+def _load_history():
     try:
-        response = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-            json={"model": GROQ_MODEL, "messages": messages, "max_tokens": 500},
-            timeout=15,
-        )
-        response.raise_for_status()
-        data = response.json()
-        return data["choices"][0]["message"]["content"]
-
-    except requests.exceptions.Timeout:
-        return "(AI request timed out - try again.)"
-    except requests.exceptions.HTTPError:
-        # Common causes: bad/expired key (401), rate limit (429)
-        status = response.status_code
-        if status == 401:
-            return "(AI error: API key was rejected - check GROQ_API_KEY in .env)"
-        elif status == 429:
-            return "(AI error: rate limit hit - wait a moment and try again)"
-        else:
-            return f"(AI error: request failed with status {status})"
+        with open(MEMORY_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, list):
+                tail = data[-MAX_HISTORY_MESSAGES:]
+                restored = [_message_from_dict(d) for d in tail]
+                if restored:
+                    config = {"configurable": {"thread_id": THREAD_ID}}
+                    graph.update_state(config, {"messages": restored})
+    except FileNotFoundError:
+        return
     except Exception as e:
-        return f"(AI error: {e})"
+        print(f"Warning: failed to load conversation history: {e}")
 
 
-def call_llm_with_tools(messages, tools):
-    """
-    *** NOT BUILT YET - SCAFFOLD FOR LATER ***
-    This is where the TARZ-style routing goes once we actually define
-    tools (functions) the AI can call: try GPT-4o-mini via GitHub Models
-    first, fall back to Cerebras if that fails. Not implemented yet
-    because there's nothing to test it with until a real tool exists -
-    build the first tool, then come back and wire this up around it.
-    """
-    raise NotImplementedError(
-        "No tools defined yet - build a tool first, then this.")
+def _save_history():
+    try:
+        config = {"configurable": {"thread_id": THREAD_ID}}
+        snapshot = graph.get_state(config)
+        messages = snapshot.values.get(
+            "messages", []) if snapshot and snapshot.values else []
+        serializable = [_message_to_dict(m) for m in messages
+                        if isinstance(m, (HumanMessage, AIMessage))][-MAX_HISTORY_MESSAGES:]
+        with open(MEMORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(serializable, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"Warning: failed to save conversation history: {e}")
+
+
+_load_history()
 
 
 def handle_chat_message(message, context):
-    """
-    The full flow for one chat turn: build the system context, add it plus
-    history plus the new message, call the AI, save the reply, return it.
-    This is what server.py's /api/chat route calls.
-    """
-    system_message = {"role": "system",
-                      "content": build_context_message(context)}
-    conversation_history.append({"role": "user", "content": message})
+    system_message = SystemMessage(content=build_context_message(context))
+    config = {"configurable": {"thread_id": THREAD_ID}}
 
-    messages = [system_message] + conversation_history
-    reply = call_llm(messages)
+    result = graph.invoke(
+        {"messages": [system_message, HumanMessage(content=message)]},
+        config=config,
+    )
 
-    conversation_history.append({"role": "assistant", "content": reply})
-
-    # keep bounded and persist
-    del conversation_history[:-MAX_HISTORY_MESSAGES]
+    reply = _clean_tool_syntax(result["messages"][-1].content)
     _save_history()
-
     return reply

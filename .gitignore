@@ -1,1 +1,58 @@
+# Environment variables
 .env
+
+# Python virtual environment
+venv/
+.venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Conversation history
+conversation_history.json
+
+# IDE
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# SQLite databases (if you use them)
+*.sqlite3
+*.db
+
+# Build files
+build/
+dist/
+*.egg-info/
+
+# Test cache
+.pytest_cache/
+.mypy_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Coverage
+.coverage
+htmlcov/
+
+# Large model files (if any)
+models/
+weights/
+checkpoints/
+
+# AI cache
+catalog_cache/
+
+# Temporary files
+temp/
+tmp/

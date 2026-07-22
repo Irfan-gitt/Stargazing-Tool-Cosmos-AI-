@@ -32,6 +32,9 @@ import ai_chat
 from sky_engine import SkyEngine
 
 CATALOG_REFRESH_SECONDS = 20  # how often to recompute all star/planet alt-az
+# Orbital positions are recalculated independently from the static sky catalog.
+# Half-second updates make ISS and satellites visibly move across the view.
+SATELLITE_REFRESH_SECONDS = 0.5
 
 sky = SkyEngine()  # loads catalogs + ephemeris once at startup
 
@@ -64,15 +67,28 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     last_sent = None
     last_catalog_time = 0.0
+    last_satellite_time = 0.0
     try:
         while True:
             state = phone.get_current_state()
             az, alt, lat, lon = state["az"], state["alt"], state["lat"], state["lon"]
 
             if time.time() - last_catalog_time > CATALOG_REFRESH_SECONDS:
-                snapshot = sky.compute_catalog_snapshot(lat, lon)
-                await websocket.send_json(snapshot)
+                try:
+                    snapshot = sky.compute_catalog_snapshot(lat, lon)
+                    await websocket.send_json(snapshot)
+                except Exception as exc:
+                    print(f"Catalog update unavailable: {exc}")
                 last_catalog_time = time.time()
+
+            if time.time() - last_satellite_time > SATELLITE_REFRESH_SECONDS:
+                # Satellite data is optional: a transient TLE/provider issue
+                # must never stop the main star-map WebSocket.
+                try:
+                    await websocket.send_json(sky.compute_satellite_snapshot(lat, lon))
+                except Exception as exc:
+                    print(f"Satellite position update unavailable: {exc}")
+                last_satellite_time = time.time()
 
             if az is not None and (az, alt) != last_sent:
                 await websocket.send_json({"type": "pointing", "az": az, "alt": alt, "lat": lat, "lon": lon})

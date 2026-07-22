@@ -97,12 +97,18 @@
       text-transform: uppercase;
       cursor: pointer;
       z-index: 50;
-      transition: background 0.15s ease, color 0.15s ease;
+      transition: background 0.15s ease, color 0.15s ease, opacity 0.15s ease;
     }
 
     #askAiBtn:hover {
       background: var(--accent-dim);
       color: var(--accent-bright);
+    }
+
+    #askAiBtn.is-hidden {
+      opacity: 0;
+      visibility: hidden;
+      pointer-events: none;
     }
 
     /* ── Side panel ───────────────────────────────────────────────── */
@@ -193,6 +199,62 @@
 
     #contextChip .chipClear:hover {
       opacity: 1;
+    }
+
+    #toolsSummary {
+      margin: 12px 20px 0;
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      background: rgba(255, 255, 255, 0.015);
+      flex-shrink: 0;
+    }
+
+    #toolsSummary summary {
+      cursor: pointer;
+      list-style: none;
+      padding: 9px 11px;
+      color: var(--text-dim);
+      font-family: var(--font-mono);
+      font-size: 10px;
+      letter-spacing: 0.7px;
+      text-transform: uppercase;
+    }
+
+    #toolsSummary summary::-webkit-details-marker {
+      display: none;
+    }
+
+    #toolsSummary summary::after {
+      content: '+';
+      float: right;
+      color: var(--accent);
+      font-size: 14px;
+      line-height: 9px;
+    }
+
+    #toolsSummary[open] summary {
+      border-bottom: 1px solid var(--border);
+      color: var(--accent-bright);
+    }
+
+    #toolsSummary[open] summary::after {
+      content: '−';
+    }
+
+    .toolGroups {
+      padding: 9px 11px 11px;
+      display: grid;
+      gap: 7px;
+      font-size: 11px;
+      line-height: 1.35;
+      color: var(--text-dim);
+    }
+
+    .toolGroups b {
+      color: var(--text);
+      font-family: var(--font-mono);
+      font-size: 10px;
+      letter-spacing: 0.4px;
     }
 
     /* ── Chat: terminal-log style, not chat-bubble style ─────────────── */
@@ -311,11 +373,20 @@
       <span class="chipClear" id="chipClear">&times;</span>
       Context — <span class="chipName" id="chipName"></span>
     </div>
+    <details id="toolsSummary">
+      <summary>17 live tools · view capabilities</summary>
+      <div class="toolGroups">
+        <div><b>Research</b> NASA articles, discoveries, web search</div>
+        <div><b>Observe</b> local time, weather, Moon, night planning, rise/set, light pollution</div>
+        <div><b>Explore</b> object catalog, meteor showers, photo and equipment advice</div>
+        <div><b>Satellites</b> live status, TLEs, visible passes, ISS, Tiangong, Hubble, Starlink</div>
+      </div>
+    </details>
     <div id="chatMessages">
       <div class="msg ai placeholder">
         <div class="msgLabel">AI</div>
-        <div class="msgBody">Ask me anything about what you're looking at, or the sky in general. (Not wired up to a
-          real AI yet — this is UI only for now.)</div>
+        <div class="msgBody">Ask about the sky, your current target, live satellite passes, or tonight's observing
+          conditions.</div>
       </div>
     </div>
     <div id="chatInputRow">
@@ -338,8 +409,14 @@
 
     let currentContext = null; // whatever object is currently nearest the crosshair (auto-tracked every frame)
 
-    function openPanel() { panel.classList.add('open'); }
-    function closePanel() { panel.classList.remove('open'); }
+    function openPanel() {
+      panel.classList.add('open');
+      askAiBtn.classList.add('is-hidden');
+    }
+    function closePanel() {
+      panel.classList.remove('open');
+      askAiBtn.classList.remove('is-hidden');
+    }
 
     document.getElementById('closeBtn').onclick = closePanel;
     askAiBtn.onclick = openPanel;
@@ -370,10 +447,14 @@
       addMessage(text, 'user');
       const thinking = addMessage('Thinking...', 'ai placeholder');
       try {
+        // Location is useful for time, weather, pass, and rise/set tools even
+        // when the crosshair is not currently near a catalog object.
+        const chatContext = currentContext ||
+          (pointing.lat != null && pointing.lon != null ? { lat: pointing.lat, lon: pointing.lon } : null);
         const res = await fetch('/api/chat', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ message: text, context: currentContext })
+          body: JSON.stringify({ message: text, context: chatContext })
         });
         const data = await res.json();
         thinking.remove();
@@ -425,12 +506,30 @@
       ctx.lineWidth = 1.4;
 
       if (icon === 'galaxy') {
-        // ellipse shaped to the object's extent/orientation - standard galaxy symbol
+        // Tilted spiral galaxy: bright gradient core (like a real galaxy's
+        // nucleus) plus two curved spiral-arm strokes, instead of a flat
+        // empty ellipse outline.
         ctx.save();
         ctx.translate(sx, sy);
         ctx.rotate(-0.5);
+        const core = ctx.createRadialGradient(0, 0, 0, 0, 0, 9);
+        core.addColorStop(0, 'rgba(235, 230, 255, 0.95)');
+        core.addColorStop(0.35, 'rgba(160, 180, 220, 0.55)');
+        core.addColorStop(1, 'rgba(122, 155, 176, 0)');
+        ctx.fillStyle = core;
         ctx.beginPath();
-        ctx.ellipse(0, 0, 7, 3, 0, 0, Math.PI * 2);
+        ctx.ellipse(0, 0, 9, 3.5, 0, 0, Math.PI * 2);
+        ctx.fill();
+        // outer disk edge
+        ctx.beginPath();
+        ctx.ellipse(0, 0, 7, 2.8, 0, 0, Math.PI * 2);
+        ctx.stroke();
+        // two spiral-arm hints curling off the disk
+        ctx.beginPath();
+        ctx.arc(2.5, 0, 4.5, 0.5, 2.6);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.arc(-2.5, 0, 4.5, 3.6, 5.7);
         ctx.stroke();
         ctx.restore();
       } else if (icon === 'globular') {
@@ -464,13 +563,70 @@
         }
         ctx.stroke();
       } else {
-        // nebula (default) - solid-line open square, per the standard atlas key
-        ctx.strokeRect(sx - 5, sy - 5, 10, 10);
+        // nebula (default) - soft irregular gas-cloud glow (like the Rosette/
+        // emission nebulae) instead of a plain empty square.
+        ctx.save();
+        ctx.translate(sx, sy);
+        const glow = ctx.createRadialGradient(0, 0, 0, 0, 0, 9);
+        glow.addColorStop(0, 'rgba(122, 200, 180, 0.6)');
+        glow.addColorStop(0.55, 'rgba(90, 160, 150, 0.28)');
+        glow.addColorStop(1, 'rgba(90, 160, 150, 0)');
+        ctx.fillStyle = glow;
+        // a handful of overlapping puffs gives an irregular cloud silhouette
+        // rather than a perfect circle
+        const puffs = [[0, 0, 6.5], [3.5, -2.5, 4], [-3.5, -2, 4], [2.5, 3.5, 4], [-3, 3, 3.5]];
+        ctx.beginPath();
+        for (const [dx, dy, r] of puffs) ctx.moveTo(dx + r, dy), ctx.arc(dx, dy, r, 0, Math.PI * 2);
+        ctx.fill();
+        // faint outer ring to keep it identifiable as an atlas symbol
+        ctx.globalAlpha = 0.8;
+        ctx.beginPath();
+        ctx.arc(0, 0, 8, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.restore();
       }
     }
 
+    // Small satellite glyph - central body + two solar-panel wings with
+    // grid lines, echoing real station/satellite photos (ISS-style),
+    // instead of a plain rotated square.
+    function drawSatelliteIcon(sx, sy, color, size) {
+      ctx.save();
+      ctx.translate(sx, sy);
+      ctx.rotate(Math.PI / 4);
+
+      // solar panel wings (drawn first, so the body sits on top)
+      const panelLen = size * 2.3;
+      const panelW = size * 0.85;
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 0.7;
+      for (const side of [-1, 1]) {
+        const px = side * size * 0.4;
+        ctx.fillStyle = 'rgba(255,255,255,0.10)';
+        ctx.fillRect(Math.min(px, px + side * panelLen), -panelW / 2, panelLen, panelW);
+        ctx.strokeRect(Math.min(px, px + side * panelLen), -panelW / 2, panelLen, panelW);
+        // grid lines across the panel, like real solar cells
+        for (let i = 1; i < 4; i++) {
+          const gx = px + side * (panelLen / 4) * i;
+          ctx.beginPath();
+          ctx.moveTo(gx, -panelW / 2);
+          ctx.lineTo(gx, panelW / 2);
+          ctx.stroke();
+        }
+      }
+
+      // central body
+      ctx.fillStyle = color;
+      ctx.shadowColor = color;
+      ctx.shadowBlur = size * 1.4;
+      ctx.fillRect(-size * 0.35, -size, size * 0.7, size * 2);
+      ctx.shadowBlur = 0;
+
+      ctx.restore();
+    }
+
     let pointing = { az: null, alt: null, lat: null, lon: null };
-    let catalog = { stars: [], messier: [], planets: [], constellation_lines: [] };
+    let catalog = { stars: [], messier: [], planets: [], satellites: [], constellation_lines: [] };
     let clickables = [];
 
     function toRad(d) { return d * Math.PI / 180; }
@@ -495,7 +651,7 @@
         if (d < bestDist) { bestDist = d; best = c; }
       }
       if (best) {
-        currentContext = { ...best, angularDistance: bestDist };
+        currentContext = { ...best, angularDistance: bestDist, lat: pointing.lat, lon: pointing.lon };
         chipName.textContent = best.name;
         contextChip.classList.add('visible');
       } else {
@@ -634,6 +790,33 @@
         clickables.push({ x: sx, y: sy, name: pl.name, type: 'planet', mag: null, az: pl.az, alt: pl.alt });
       }
 
+      // Live satellites: cyan diamonds distinguish fast-moving artificial
+      // objects from stars. Their server positions are recalculated twice a
+      // second, so they move across the map rather than behaving like stars.
+      for (const sat of catalog.satellites) {
+        const p = project(sat.az, sat.alt);
+        if (!p || Math.abs(p.x) > halfW || Math.abs(p.y) > halfH) continue;
+        const sx = cx + p.x * scale;
+        const sy = cy - p.y * scale;
+        const color = sat.kind === 'starlink' ? '#8ed9e8' : '#51e7ff';
+        const radius = sat.kind === 'starlink' ? 3.5 : 6;
+        drawSatelliteIcon(sx, sy, color, radius);
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(sx - 14, sy + 10); ctx.lineTo(sx - 5, sy + 4);
+        ctx.stroke();
+        if (sat.kind !== 'starlink') {
+          ctx.fillStyle = color;
+          ctx.font = 'bold 11px "IBM Plex Mono", monospace';
+          ctx.fillText(sat.name, sx + 9, sy - 7);
+        }
+        clickables.push({
+          x: sx, y: sy, name: sat.name, type: sat.kind,
+          mag: null, az: sat.az, alt: sat.alt, rangeKm: sat.range_km
+        });
+      }
+
       // ── Auto-track the object nearest the crosshair, every frame ────────
       // This is what makes "point and ask" work without clicking: whatever
       // you're actually pointing at becomes the AI's context automatically.
@@ -683,7 +866,7 @@
     });
 
     function setContext(obj) {
-      currentContext = obj;
+      currentContext = { ...obj, lat: pointing.lat, lon: pointing.lon };
       chipName.textContent = obj.name;
       contextChip.classList.add('visible');
       openPanel();
@@ -696,7 +879,12 @@
       ws.onmessage = (event) => {
         const msg = JSON.parse(event.data);
         if (msg.type === 'catalog') {
-          catalog = msg;
+          // A catalog refresh is less frequent than the moving-satellite
+          // layer. Preserve the latest satellite positions rather than
+          // replacing them with an object that has no satellites field.
+          catalog = { ...msg, satellites: catalog.satellites || [] };
+        } else if (msg.type === 'satellites') {
+          catalog.satellites = msg.satellites || [];
         } else if (msg.type === 'pointing') {
           pointing = { az: msg.az, alt: msg.alt, lat: msg.lat, lon: msg.lon };
         }
